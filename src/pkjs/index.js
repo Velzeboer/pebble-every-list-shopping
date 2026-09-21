@@ -26,6 +26,7 @@ var clayConfig = [
     items: [
       { type: 'heading', defaultValue: 'List' },
       { type: 'input', messageKey: 'anylist_list', label: 'List name', description: 'Leave blank to use your first list.' },
+      { type: 'toggle', messageKey: 'start_on_selection', label: 'Start on list selection', defaultValue: false },
       { type: 'toggle', messageKey: 'hide_checked', label: 'Hide checked off items from the list', defaultValue: false },
       { type: 'toggle', messageKey: 'close_after_delete', label: 'Close after Delete Checked Items', defaultValue: false }
     ]
@@ -43,17 +44,33 @@ var CMD_LIST_END = 3;
 var CMD_ERROR = 4;
 var CMD_TOGGLE_OK = 5;
 var CMD_CLOSE = 6;           // phone -> watch (exit the app)
+var CMD_LISTS_START = 7;     // phone -> watch (list overview)
+var CMD_LIST_ROW = 8;        // phone -> watch (one list in the overview)
+var CMD_LISTS_END = 9;       // phone -> watch
 var CMD_REFRESH = 10;        // watch -> phone
 var CMD_TOGGLE = 11;         // watch -> phone
 var CMD_DELETE_CHECKED = 12; // watch -> phone
+var CMD_OPEN_LIST = 13;      // watch -> phone (open list by overview index)
 
 var MAX_NAME = 40;
 var MAX_CAT = 26;
 
 var client = null;
 var items = []; // [{ id, name, cat, checked }]
+var overviewLists = []; // [{ id, name, icon, color }]
+var activeListName = null; // list chosen from the overview (overrides the setting)
 var sendQueue = [];
 var sending = false;
+
+// Parse "#RRGGBB" (or "#AARRGGBB") into 0xRRGGBB, or -1 if none/invalid.
+function hexToInt(hex) {
+  if (!hex) return -1;
+  hex = hex.toString().replace('#', '').trim();
+  if (hex.length === 8) hex = hex.substring(2); // drop alpha
+  if (hex.length !== 6) return -1;
+  var n = parseInt(hex, 16);
+  return isNaN(n) ? -1 : n;
+}
 
 function truncate(s, n) {
   s = (s == null) ? '' : s.toString();
@@ -143,12 +160,18 @@ function ensureClient() {
   return client;
 }
 
+// The list currently in use: one chosen from the overview, else the setting.
+function currentListName() {
+  if (activeListName) return activeListName;
+  return getSettings().anylist_list || '';
+}
+
 function loadAndSend() {
   var s = getSettings();
   var c = ensureClient();
   if (!c) { sendError('Open app settings to add login'); return; }
   var hide = !!s.hide_checked;
-  c.getCategorizedList(s.anylist_list || '', !hide, function (err, data) {
+  c.getCategorizedList(currentListName(), !hide, function (err, data) {
     if (err) { sendError(err); return; }
     flattenItems(data);
     sendList(undefined, !hide); // default focus (top); Delete button hidden if hiding checked
@@ -166,7 +189,7 @@ function toggle(idx, checked) {
   c.checkItem(toggledId, checked, function (err) {
     if (err) { sendError(err); return; }
     // Re-fetch the list from AnyList, then send it with the right focus.
-    c.getCategorizedList(s.anylist_list || '', !hide, function (err2, data) {
+    c.getCategorizedList(currentListName(), !hide, function (err2, data) {
       if (err2) { sendError(err2); return; }
       flattenItems(data);
       sendList(computeFocus(checked, toggledId, oldIdx, !hide), !hide);
@@ -179,16 +202,49 @@ function deleteChecked() {
   var c = ensureClient();
   if (!c) { sendError('Open app settings to add login'); return; }
   var closeAfter = !!s.close_after_delete;
-  c.removeCheckedItems(s.anylist_list || '', function (err) {
+  c.removeCheckedItems(currentListName(), function (err) {
     if (err) { sendError(err); return; }
     if (closeAfter) enqueue({ cmd: CMD_CLOSE }); // items are deleted -> close the app
     else loadAndSend(); // refresh the list after removal
   });
 }
 
+// Fetch all lists and send them to the watch as the overview.
+function sendOverview() {
+  var c = ensureClient();
+  if (!c) { sendError('Open app settings to add login'); return; }
+  c.getAllLists(function (err, lists) {
+    if (err) { sendError(err); return; }
+    overviewLists = lists;
+    enqueue({ cmd: CMD_LISTS_START, count: lists.length });
+    for (var i = 0; i < lists.length; i++) {
+      enqueue({ cmd: CMD_LIST_ROW, idx: i, name: truncate(lists[i].name, MAX_NAME), col: hexToInt(lists[i].color) });
+    }
+    enqueue({ cmd: CMD_LISTS_END });
+  });
+}
+
+// Open a list chosen from the overview by its index.
+function openList(idx) {
+  if (idx < 0 || idx >= overviewLists.length) return;
+  activeListName = overviewLists[idx].name;
+  loadAndSend();
+}
+
+// Decide what to show at startup based on the setting.
+function boot() {
+  if (getSettings().start_on_selection) {
+    activeListName = null;
+    sendOverview();
+  } else {
+    activeListName = null;
+    loadAndSend();
+  }
+}
+
 // ---- Pebble events ----
 Pebble.addEventListener('ready', function () {
-  loadAndSend();
+  boot();
 });
 
 Pebble.addEventListener('appmessage', function (e) {
@@ -196,12 +252,13 @@ Pebble.addEventListener('appmessage', function (e) {
   if (p.cmd === CMD_REFRESH) loadAndSend();
   else if (p.cmd === CMD_TOGGLE) toggle(p.idx, p.chk ? true : false);
   else if (p.cmd === CMD_DELETE_CHECKED) deleteChecked();
+  else if (p.cmd === CMD_OPEN_LIST) openList(p.idx);
 });
 
-// When settings are saved, drop the cached client and reload.
+// When settings are saved, drop the cached client and re-run the startup flow.
 Pebble.addEventListener('webviewclosed', function (e) {
   if (e && e.response) {
     client = null;
-    setTimeout(loadAndSend, 300);
+    setTimeout(boot, 300);
   }
 });

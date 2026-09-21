@@ -7,9 +7,13 @@
 #define CMD_ERROR      4
 #define CMD_TOGGLE_OK  5
 #define CMD_CLOSE      6   // phone -> watch: exit the app
+#define CMD_LISTS_START 7  // phone -> watch: begin list overview
+#define CMD_LIST_ROW    8  // phone -> watch: one overview row
+#define CMD_LISTS_END   9  // phone -> watch: end list overview
 #define CMD_REFRESH    10  // watch -> phone
 #define CMD_TOGGLE     11  // watch -> phone
 #define CMD_DELETE_CHECKED 12  // watch -> phone
+#define CMD_OPEN_LIST  13  // watch -> phone: open list by overview index
 
 #define MAX_ITEMS   256
 #define MAX_SECTIONS 48
@@ -44,10 +48,20 @@ static bool s_ready = false;
 static bool s_show_actions = true;   // whether to show the Delete button
 static char s_title[CAT_LEN] = "Shopping";
 
+// --- List overview (multi-list) ---
+typedef struct { char name[NAME_LEN]; uint8_t r, g, b; bool has_color; } ListEntry;
+static ListEntry *s_lists = NULL;
+static int s_lists_count = 0;
+static int s_lists_expected = 0;
+static Window *s_overview_window = NULL;
+static MenuLayer *s_overview_menu = NULL;
+static bool s_overview_active = false;
+
 // ---------------------------------------------------------------------------
 // UI state helpers
 // ---------------------------------------------------------------------------
 static void set_status(const char *text) {
+  if (!s_status_layer || !s_menu_layer) return; // list window not loaded (e.g. overview showing)
   text_layer_set_text(s_status_layer, text);
   layer_set_hidden(text_layer_get_layer(s_status_layer), false);
   layer_set_hidden(menu_layer_get_layer(s_menu_layer), true);
@@ -115,6 +129,15 @@ static void send_toggle(int idx, int checked) {
   dict_write_int(iter, MESSAGE_KEY_cmd, &c, sizeof(int), true);
   dict_write_int(iter, MESSAGE_KEY_idx, &i, sizeof(int), true);
   dict_write_int(iter, MESSAGE_KEY_chk, &ch, sizeof(int), true);
+  app_message_outbox_send();
+}
+
+static void send_open_list(int idx) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  int c = CMD_OPEN_LIST, i = idx;
+  dict_write_int(iter, MESSAGE_KEY_cmd, &c, sizeof(int), true);
+  dict_write_int(iter, MESSAGE_KEY_idx, &i, sizeof(int), true);
   app_message_outbox_send();
 }
 
@@ -404,6 +427,104 @@ static void menu_selection_changed(MenuLayer *ml, MenuIndex new_index, MenuIndex
 }
 
 // ---------------------------------------------------------------------------
+// List overview window (shown at startup when "Start on list selection" is on)
+// ---------------------------------------------------------------------------
+static uint16_t ov_num_sections(MenuLayer *ml, void *ctx) { return 1; }
+static uint16_t ov_num_rows(MenuLayer *ml, uint16_t section, void *ctx) { return s_lists_count; }
+
+static int16_t ov_cell_height(MenuLayer *ml, MenuIndex *ci, void *ctx) {
+  int16_t h = layer_get_bounds(menu_layer_get_layer(s_overview_menu)).size.h;
+  return h / 4; // exactly 4 rows visible at once
+}
+
+static GColor ov_list_color(int i) {
+  if (i >= 0 && i < s_lists_count && s_lists[i].has_color) {
+    return GColorFromRGB(s_lists[i].r, s_lists[i].g, s_lists[i].b);
+  }
+  return GColorFromRGB(170, 170, 170);
+}
+
+// Text colour that contrasts with a highlighted row's (coloured) background.
+static GColor ov_contrast(int i) {
+  if (i >= 0 && i < s_lists_count && s_lists[i].has_color) {
+    int lum = (s_lists[i].r * 299 + s_lists[i].g * 587 + s_lists[i].b * 114) / 1000;
+    return (lum > 140) ? GColorBlack : GColorWhite;
+  }
+  return GColorBlack;
+}
+
+static void ov_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *ci, void *context) {
+  int i = ci->row;
+  if (i < 0 || i >= s_lists_count) return;
+  GRect b = layer_get_bounds(cell_layer);
+  MenuIndex sel = menu_layer_get_selected_index(s_overview_menu);
+  bool hl = (sel.row == ci->row);
+  GColor listcol = ov_list_color(i);
+
+  // Selected row: background is the list's own colour.
+  graphics_context_set_fill_color(ctx, hl ? listcol : GColorWhite);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+
+  GColor fg = hl ? ov_contrast(i) : GColorBlack;
+
+  // Icon = a filled dot in the list colour (contrast colour when highlighted).
+  int16_t cy = b.size.h / 2;
+  int16_t dotr = 6;
+  graphics_context_set_fill_color(ctx, hl ? fg : listcol);
+  graphics_fill_circle(ctx, GPoint(6 + dotr, cy), dotr);
+
+  int16_t tx = 6 + dotr * 2 + 6; // dot + a space, then the name
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GSize sz = graphics_text_layout_get_content_size(s_lists[i].name, f, GRect(0, 0, 2000, 1000),
+               GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+  int16_t ty = (b.size.h - sz.h) / 2 - 4;
+  graphics_context_set_text_color(ctx, fg);
+  graphics_draw_text(ctx, s_lists[i].name, f, GRect(tx, ty, b.size.w - tx - 4, sz.h),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void ov_select(MenuLayer *ml, MenuIndex *ci, void *context) {
+  int i = ci->row;
+  if (i < 0 || i >= s_lists_count) return;
+  window_stack_push(s_window, true); // list window (shows Loading) on top of overview
+  send_open_list(i);
+}
+
+static void overview_window_load(Window *w) {
+  Layer *root = window_get_root_layer(w);
+  s_overview_menu = menu_layer_create(layer_get_bounds(root));
+  menu_layer_set_callbacks(s_overview_menu, NULL, (MenuLayerCallbacks){
+    .get_num_sections = ov_num_sections,
+    .get_num_rows = ov_num_rows,
+    .get_cell_height = ov_cell_height,
+    .draw_row = ov_draw_row,
+    .select_click = ov_select,
+  });
+  menu_layer_set_click_config_onto_window(s_overview_menu, w);
+  layer_add_child(root, menu_layer_get_layer(s_overview_menu));
+  if (s_lists_count > 0) menu_layer_reload_data(s_overview_menu);
+}
+
+static void overview_window_unload(Window *w) {
+  if (s_overview_menu) { menu_layer_destroy(s_overview_menu); s_overview_menu = NULL; }
+}
+
+// Make the overview the root window (replacing the initial loading list window).
+static void ensure_overview_shown(void) {
+  if (s_overview_active) return;
+  if (!s_overview_window) {
+    s_overview_window = window_create();
+    window_set_window_handlers(s_overview_window, (WindowHandlers){
+      .load = overview_window_load,
+      .unload = overview_window_unload,
+    });
+  }
+  window_stack_push(s_overview_window, false);
+  window_stack_remove(s_window, false); // drop the initial loading list window
+  s_overview_active = true;
+}
+
+// ---------------------------------------------------------------------------
 // Inbox: messages from the phone
 // ---------------------------------------------------------------------------
 static void inbox_received(DictionaryIterator *iter, void *context) {
@@ -508,6 +629,50 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       break;
     }
 
+    case CMD_LISTS_START: {
+      if (s_lists) { free(s_lists); s_lists = NULL; }
+      Tuple *count_t = dict_find(iter, MESSAGE_KEY_count);
+      s_lists_expected = count_t ? count_t->value->int32 : 0;
+      if (s_lists_expected > MAX_ITEMS) s_lists_expected = MAX_ITEMS;
+      s_lists_count = 0;
+      if (s_lists_expected > 0) {
+        s_lists = (ListEntry *)malloc(sizeof(ListEntry) * s_lists_expected);
+        if (!s_lists) s_lists_expected = 0;
+        else memset(s_lists, 0, sizeof(ListEntry) * s_lists_expected);
+      }
+      ensure_overview_shown();
+      break;
+    }
+
+    case CMD_LIST_ROW: {
+      Tuple *idx_t = dict_find(iter, MESSAGE_KEY_idx);
+      Tuple *name_t = dict_find(iter, MESSAGE_KEY_name);
+      Tuple *col_t = dict_find(iter, MESSAGE_KEY_col);
+      if (!idx_t || !s_lists) return;
+      int i = idx_t->value->int32;
+      if (i < 0 || i >= s_lists_expected) return;
+      if (name_t) {
+        strncpy(s_lists[i].name, name_t->value->cstring, NAME_LEN - 1);
+        s_lists[i].name[NAME_LEN - 1] = '\0';
+      }
+      int col = col_t ? col_t->value->int32 : -1;
+      if (col >= 0) {
+        s_lists[i].r = (col >> 16) & 0xFF;
+        s_lists[i].g = (col >> 8) & 0xFF;
+        s_lists[i].b = col & 0xFF;
+        s_lists[i].has_color = true;
+      } else {
+        s_lists[i].has_color = false;
+      }
+      if (i + 1 > s_lists_count) s_lists_count = i + 1;
+      break;
+    }
+
+    case CMD_LISTS_END: {
+      if (s_overview_menu) menu_layer_reload_data(s_overview_menu);
+      break;
+    }
+
     case CMD_ERROR: {
       Tuple *msg_t = dict_find(iter, MESSAGE_KEY_msg);
       static char err[64];
@@ -559,8 +724,10 @@ static void window_load(Window *window) {
 }
 
 static void window_unload(Window *window) {
-  menu_layer_destroy(s_menu_layer);
-  text_layer_destroy(s_status_layer);
+  stop_pulse();
+  stop_marquee();
+  if (s_menu_layer) { menu_layer_destroy(s_menu_layer); s_menu_layer = NULL; }
+  if (s_status_layer) { text_layer_destroy(s_status_layer); s_status_layer = NULL; }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +751,9 @@ static void deinit(void) {
   stop_pulse();
   stop_marquee();
   free_items();
+  if (s_lists) { free(s_lists); s_lists = NULL; }
   window_destroy(s_window);
+  if (s_overview_window) window_destroy(s_overview_window);
 }
 
 int main(void) {

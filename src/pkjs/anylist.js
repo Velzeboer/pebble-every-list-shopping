@@ -281,7 +281,7 @@ function parseCategoryOrdering(bytes) {
 }
 
 function parseListSettings(bytes) {
-  var s = { listId: '', userId: '', selectedCategoryOrdering: '', listCategoryGroupId: '', categoryOrderings: [] };
+  var s = { listId: '', userId: '', selectedCategoryOrdering: '', listCategoryGroupId: '', categoryOrderings: [], iconName: '', tintHexColor: '' };
   pb.eachField(bytes, function (f, v, wt) {
     if (wt !== 2) return;
     if (f === 3) s.listId = pb.utf8ToStr(v);
@@ -289,6 +289,13 @@ function parseListSettings(bytes) {
     else if (f === 6) s.selectedCategoryOrdering = pb.utf8ToStr(v);
     else if (f === 27) s.listCategoryGroupId = pb.utf8ToStr(v);
     else if (f === 7) s.categoryOrderings.push(parseCategoryOrdering(v));
+    else if (f === 32) { // PBIcon { iconName=1, tintHexColor=2 }
+      pb.eachField(v, function (ff, vv, ww) {
+        if (ww !== 2) return;
+        if (ff === 1) s.iconName = pb.utf8ToStr(vv);
+        else if (ff === 2) s.tintHexColor = pb.utf8ToStr(vv);
+      });
+    }
   });
   return s;
 }
@@ -403,6 +410,30 @@ function categorize(data, listName, showChecked, meta) {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+// Return every list on the account: [{ id, name, icon, color }].
+AnyListClient.prototype.getAllLists = function (cb) {
+  this._dataPost('data/user-data/get', null, null, function (err, bytes) {
+    if (err) { cb(err); return; }
+    var data;
+    try { data = parseUserData(bytes); } catch (e) { cb('Could not read AnyList data'); return; }
+    var out = [];
+    for (var i = 0; i < data.lists.length; i++) {
+      var l = data.lists[i];
+      var s = null;
+      for (var j = 0; j < data.settings.length; j++) {
+        if (data.settings[j].listId === l.identifier) { s = data.settings[j]; break; }
+      }
+      out.push({
+        id: l.identifier,
+        name: l.name || '',
+        icon: (s && s.iconName) || '',
+        color: (s && s.tintHexColor) || ''
+      });
+    }
+    cb(null, out);
+  });
+};
+
 AnyListClient.prototype.getCategorizedList = function (listName, showChecked, cb) {
   var self = this;
   this._dataPost('data/user-data/get', null, null, function (err, bytes) {

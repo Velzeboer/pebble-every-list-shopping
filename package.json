@@ -1,7 +1,7 @@
 {
   "name": "anylist-shopping",
   "author": "Marshal",
-  "version": "1.2.6",
+  "version": "1.3.0",
   "keywords": ["pebble-app"],
   "private": true,
   "dependencies": {},
@@ -28,7 +28,9 @@
       "anylist_password",
       "anylist_list",
       "hide_checked",
-      "close_after_delete"
+      "close_after_delete",
+      "start_on_selection",
+      "col"
     ],
     "resources": {
       "media": []
